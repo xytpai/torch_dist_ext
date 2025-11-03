@@ -1,5 +1,16 @@
 #pragma once
 
+#include <iostream>
+#include <stdlib.h>
+#include <time.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <cassert>
+#include <vector>
+#include <tuple>
+#include <unordered_map>
+
 #if defined(__HIPCC__)
 
 #include <hip/hip_runtime.h>
@@ -81,47 +92,3 @@
 #define gpuLaunchCooperativeKernel cudaLaunchCooperativeKernel
 
 #endif
-
-template <typename scalar_t, int vec_size>
-struct alignas(sizeof(scalar_t) * vec_size) aligned_array {
-    scalar_t val[vec_size];
-};
-
-template <typename T, int vec_size, int loops>
-__global__ void threads_copy_kernel(const T *in, T *out, const size_t n) {
-    const int block_work_size = loops * blockDim.x * vec_size;
-    auto index = blockIdx.x * block_work_size + threadIdx.x * vec_size;
-#pragma unroll
-    for (int i = 0; i < loops; ++i) {
-        auto remaining = n - index;
-        if (remaining < vec_size) {
-            for (auto i = index; i < n; i++) {
-                out[i] = in[i];
-            }
-        } else {
-            using vec_t = aligned_array<T, vec_size>;
-            auto in_vec = reinterpret_cast<vec_t *>(const_cast<T *>(&in[index]));
-            auto out_vec = reinterpret_cast<vec_t *>(&out[index]);
-            *out_vec = *in_vec;
-        }
-        index += blockDim.x * vec_size;
-    }
-}
-
-template <typename T, int vec_size, int loops>
-void threads_copy(const T *in, T *out, size_t n, gpuStream_t s) {
-    const int block_size = 256;
-    const int block_work_size = loops * block_size * vec_size;
-    dim3 threadsPerBlock(block_size);
-    dim3 numBlocks((n + block_work_size - 1) / block_work_size);
-    threads_copy_kernel<T, vec_size, loops><<<numBlocks, threadsPerBlock, 0, s>>>(in, out, n);
-}
-
-void memcpy_peer_async(unsigned char *dst, int dst_dev, unsigned char *src, int src_dev, size_t n, gpuStream_t s, bool use_p2p) {
-    if (use_p2p) {
-        gpuMemcpyPeerAsync(dst, dst_dev, src, src_dev, n, s);
-    } else {
-        gpuSetDevice(dst_dev);
-        threads_copy<unsigned char, 16, 1>(src, dst, n, s);
-    }
-}
