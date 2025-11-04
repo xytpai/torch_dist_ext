@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.12)
+get_filename_component(PROJECT_NAME ${CMAKE_CURRENT_SOURCE_DIR} NAME)
+project(${PROJECT_NAME})
+set(CMAKE_CXX_STANDARD 20)
+set(ROOTDIR ${PROJECT_SOURCE_DIR})
+
+include_directories(${ROOTDIR}/include)
+
+find_package(HIP REQUIRED)
+if(HIP_FOUND)
+    enable_language(HIP)
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --std=c++20")
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --expt-relaxed-constexpr")
+    file(GLOB KERNEL_SRCS "src/*.cpp")
+    add_library(${PROJECT_NAME}_device SHARED ${KERNEL_SRCS})
+endif(HIP_FOUND)
+
+message(${pybind11_DIR})
+find_package(pybind11 REQUIRED)
+message(${Torch_DIR})
+find_package(Torch REQUIRED)
+
+pybind11_add_module(${PROJECT_NAME} register.cpp)
+target_link_libraries(${PROJECT_NAME} PRIVATE ${TORCH_LIBRARIES} ${PROJECT_NAME}_device)
+target_include_directories(${PROJECT_NAME} PRIVATE ${TORCH_INCLUDE_DIRS})
