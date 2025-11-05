@@ -1,1 +1,1 @@
-This repo performs aggressive communication fusion
+This repo performs `allreduce+rms+quant` fusion operators

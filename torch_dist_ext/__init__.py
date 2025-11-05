@@ -8,6 +8,5 @@ filename = os.path.join(os.path.dirname(this_dir), f"lib{package_name}.so")
 print("Loading extension from:", filename)
 torch.ops.load_library(filename)
 
-
-CommWorkspace = torch.classes.cgemm.CommWorkspace
-allreduce_rms_fusion = torch.ops.cgemm.allreduce_rms_fusion
+CommWorkspace = eval(f"torch.classes.{package_name}.CommWorkspace")
+allreduce_rms_fusion = eval(f"torch.ops.{package_name}.allreduce_rms_fusion")

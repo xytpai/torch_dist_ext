@@ -1,5 +1,5 @@
-#include "cgemm.h"
 #include "all_reduce_fusion.h"
+#include "all_reduce_fusion_impl.h"
 
 template <typename T>
 struct KernelElementType {

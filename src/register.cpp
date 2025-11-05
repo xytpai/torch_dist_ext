@@ -1,7 +1,7 @@
 #include <torch/extension.h>
-#include "cgemm.h"
+#include "all_reduce_fusion.h"
 
-TORCH_LIBRARY(cgemm, m) {
+TORCH_LIBRARY(torch_dist_ext, m) {
     m.class_<CommWorkspace>("CommWorkspace")
         .def(torch::init<int64_t, int64_t, int64_t, int64_t>())
         .def("get_handle", &CommWorkspace::get_handle)
@@ -10,6 +10,6 @@ TORCH_LIBRARY(cgemm, m) {
     m.def("allreduce_rms_fusion(SymInt rank, SymInt nranks, Tensor allreduce_in, Tensor residual_in, Tensor rms_gamma, Tensor residual_out, Tensor norm_out, float eps, Tensor workspace) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(cgemm, CUDA, m) {
+TORCH_LIBRARY_IMPL(torch_dist_ext, CUDA, m) {
     m.impl("allreduce_rms_fusion", &allreduce_rms_fusion);
 }
