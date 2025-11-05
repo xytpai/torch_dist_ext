@@ -15,6 +15,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_cooperative_groups.h>
 
 #define gpuMemcpy hipMemcpy
@@ -51,10 +52,13 @@
 
 #define gpuLaunchCooperativeKernel hipLaunchCooperativeKernel
 
+#define __bfloat16 __hip_bfloat16
+
 #else
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cooperative_groups.h>
 
 #define gpuMemcpy cudaMemcpy
@@ -90,5 +94,7 @@
 #define gpuDevAttrMultiProcessorCount cudaDevAttrMultiProcessorCount
 
 #define gpuLaunchCooperativeKernel cudaLaunchCooperativeKernel
+
+#define __bfloat16 __nv_bfloat16
 
 #endif

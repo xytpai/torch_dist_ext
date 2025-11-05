@@ -251,25 +251,18 @@ void runbench(int nranks, int size, int hidden_dim, float eps = 1e-6, float atol
 
     for (int rank = 0; rank < nranks; ++rank) {
         gpuSetDevice(rank);
-        allreduce_fusion::AllReduceFusionParams<float> params;
-        params.nranks = nranks;
-        params.rank = rank;
-        params.size = size;
-        params.hidden_dim = hidden_dim;
-        params.workspace = workspaces[rank].workspace();
-        params.allreduce_in = gpu_inputs[rank].allreduce_in;
-        params.residual_in = gpu_inputs[rank].residual_in;
-        params.residual_out = gpu_inputs[rank].residual_out;
-        params.norm_out = gpu_inputs[rank].norm_out;
-        params.rms_gamma = gpu_inputs[rank].rms_gamma;
-        params.rms_eps = eps;
-        if (nranks == 8) {
-            allreduce_fusion::allreduce_fusion_kernel_launcher<float, 8>(params);
-        } else if (nranks == 4) {
-            allreduce_fusion::allreduce_fusion_kernel_launcher<float, 4>(params);
-        } else if (nranks == 1) {
-            allreduce_fusion::allreduce_fusion_kernel_launcher<float, 1>(params);
-        }
+        allreduce_fusion::allreduce_rms_fusion_impl<float>(
+            workspaces[rank].workspace(),
+            rank,
+            nranks,
+            size,
+            hidden_dim,
+            gpu_inputs[rank].allreduce_in,
+            gpu_inputs[rank].residual_in,
+            gpu_inputs[rank].residual_out,
+            gpu_inputs[rank].norm_out,
+            gpu_inputs[rank].rms_gamma,
+            eps);
     }
     for (int rank = 0; rank < nranks; ++rank) {
         gpuSetDevice(rank);

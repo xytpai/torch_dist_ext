@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
+import cgemm
 
 
 class RMSNorm(nn.Module):
@@ -40,7 +41,7 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps):
 
 
 def main():
-    def testcase(world_size=8, num_tokens=128, hidden_dim=1024, eps=1e-6):
+    def testcase(world_size=4, num_tokens=128, hidden_dim=1024, eps=1e-6):
         allreduce_in = torch.randn(world_size, num_tokens, hidden_dim)
         residual_in = torch.randn(num_tokens, hidden_dim)
         rms = RMSNorm(hidden_dim)

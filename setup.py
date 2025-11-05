@@ -70,6 +70,7 @@ def main():
             "build_ext": BuildExt,
             "clean": CleanCmd,
         },
+        packages=find_packages(),
     )
 
 

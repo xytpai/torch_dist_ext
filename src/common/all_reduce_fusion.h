@@ -341,9 +341,15 @@ struct neg_zero {
 };
 
 template <>
-struct neg_zero<half> {
+struct neg_zero<__half> {
     static constexpr unsigned short neg_zero_bits = 0x8000U;
     static constexpr __half value = __half_raw{neg_zero_bits};
+};
+
+template <>
+struct neg_zero<__bfloat16> {
+    static constexpr unsigned short neg_zero_bits = 0x8000U;
+    static constexpr __bfloat16 value = __hip_bfloat16_raw{neg_zero_bits};
 };
 
 template <>
@@ -376,6 +382,12 @@ __device__ bool is_negative_zero<double>(double x) {
 template <>
 __device__ bool is_negative_zero<__half>(__half x) {
     return (__half_as_ushort(x) == 0x8000);
+}
+
+// __bfloat16 specialization
+template <>
+__device__ bool is_negative_zero<__bfloat16>(__bfloat16 x) {
+    return (__bfloat16_as_ushort(x) == 0x8000);
 }
 
 template <typename T, uint32_t VEC_SIZE>
@@ -553,6 +565,40 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params) {
     dim3 numBlocks(NBLOCKS_PER_GPU);
     if (params.rank == 0) std::cout << "using twoshot\n";
     allreduce_fusion_kernel_twoshot_sync<T, NRanks><<<numBlocks, threadsPerBlock>>>(params, begin_tokens, token_num_per_ranks);
+}
+
+template <typename T>
+void allreduce_rms_fusion_impl(
+    void **workspace,
+    int rank,
+    int nranks,
+    int size,
+    int hidden_dim,
+    void *allreduce_in,
+    void *residual_in,
+    void *residual_out,
+    void *norm_out,
+    void *rms_gamma,
+    float eps) {
+    allreduce_fusion::AllReduceFusionParams<T> params;
+    params.nranks = nranks;
+    params.rank = rank;
+    params.size = size;
+    params.hidden_dim = hidden_dim;
+    params.workspace = workspace;
+    params.allreduce_in = allreduce_in;
+    params.residual_in = residual_in;
+    params.residual_out = residual_out;
+    params.norm_out = norm_out;
+    params.rms_gamma = rms_gamma;
+    params.rms_eps = eps;
+    if (nranks == 8) {
+        allreduce_fusion_kernel_launcher<T, 8>(params);
+    } else if (nranks == 4) {
+        allreduce_fusion_kernel_launcher<T, 4>(params);
+    } else if (nranks == 1) {
+        allreduce_fusion_kernel_launcher<T, 1>(params);
+    }
 }
 
 } // namespace allreduce_fusion

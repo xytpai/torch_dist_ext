@@ -4,6 +4,7 @@ import os
 import sys
 import torch
 import pybind11
+import sysconfig
 from packaging.version import Version
 from pathlib import Path
 from subprocess import CalledProcessError, check_call, check_output
@@ -100,6 +101,7 @@ class CMake:
         CMake.defines(args, 
                       pybind11_DIR=os.path.join(pybind11_dir, 'share/cmake/pybind11'),
                       Torch_DIR=os.path.join(torch_dir, 'share/cmake/Torch'),
+                      PYTHON_INCLUDE_DIR=sysconfig.get_paths()['include'],
                       CMAKE_LIBRARY_OUTPUT_DIRECTORY=output_dir)
         self.run(args, os.environ)
     
