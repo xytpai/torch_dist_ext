@@ -545,13 +545,13 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params) {
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     int threads_per_block = threads_per_token;
 
-    if (token_num <= details::kOneShotMaxToken) {
-        if (params.rank == 0) std::cout << "using oneshot\n";
-        dim3 threadsPerBlock(threads_per_block);
-        dim3 numBlocks(NBLOCKS_PER_GPU);
-        allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock>>>(params);
-        return;
-    }
+    // if (token_num <= details::kOneShotMaxToken) {
+    //     if (params.rank == 0) std::cout << "using oneshot\n";
+    //     dim3 threadsPerBlock(threads_per_block);
+    //     dim3 numBlocks(NBLOCKS_PER_GPU);
+    //     allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock>>>(params);
+    //     return;
+    // }
 
     std::array<int, NRanks> begin_tokens, token_num_per_ranks;
     int remaining_token = token_num % NRanks;
@@ -563,7 +563,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params) {
 
     dim3 threadsPerBlock(threads_per_block);
     dim3 numBlocks(NBLOCKS_PER_GPU);
-    if (params.rank == 0) std::cout << "using twoshot\n";
+    // if (params.rank == 0) std::cout << "using twoshot\n";
     allreduce_fusion_kernel_twoshot_sync<T, NRanks><<<numBlocks, threadsPerBlock>>>(params, begin_tokens, token_num_per_ranks);
 }
 
@@ -598,6 +598,8 @@ void allreduce_rms_fusion_impl(
         allreduce_fusion_kernel_launcher<T, 4>(params);
     } else if (nranks == 1) {
         allreduce_fusion_kernel_launcher<T, 1>(params);
+    } else {
+        TORCH_CHECK(false);
     }
 }
 
