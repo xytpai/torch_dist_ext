@@ -20,6 +20,7 @@ class RMSNorm(nn.Module):
 
 
 def setup(rank, world_size):
+    torch.cuda.set_device(rank)
     dist.init_process_group(
         backend='nccl',
         init_method='tcp://127.0.0.1:23456',
@@ -27,21 +28,46 @@ def setup(rank, world_size):
         world_size=world_size)
 
 
-def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps):
+class CommProcess:
+    def __init__(self, rank, world_size, size_in_bytes):
+        torch.cuda.set_device(rank)
+        nblocks = 256
+        self.comm = cgemm.CommWorkspace(rank, world_size, nblocks, size_in_bytes)
+        handle = self.comm.get_handle()
+        handle_list = [None] * world_size
+        dist.all_gather_object(handle_list, handle)
+        dist.barrier()
+        self.comm.open_handles(handle_list)
+        dist.barrier()
+
+    def workspace(self):
+        return self.comm.get_workspace()
+
+
+def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, use_fused=True):
     setup(rank, world_size)
     num_tokens, hidden_dim = residual_in.shape
     local_allreduce_in = allreduce_in[rank].cuda(rank)
     local_residual_in = residual_in.cuda(rank)
     local_rms = rms.cuda(rank)
-    dist.all_reduce(local_allreduce_in)    
-    local_norm_out = local_rms(local_allreduce_in + local_residual_in)
+    if not use_fused:
+        dist.all_reduce(local_allreduce_in)    
+        local_norm_out = local_rms(local_allreduce_in + local_residual_in)
+    else:
+        local_residual_out = torch.empty_like(local_residual_in)
+        local_norm_out = torch.empty_like(local_residual_in)
+        comm = CommProcess(rank, world_size, residual_in.numel() * residual_in.element_size())
+        workspace = comm.workspace()
+        workspace = workspace.cuda(rank)
+        cgemm.allreduce_rms_fusion(rank, world_size, local_allreduce_in, local_residual_in, 
+            local_rms.weight.data, local_residual_out, local_norm_out, eps, workspace)
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
     print(f"rank:{rank}, maxdiff:{maxdiff}")
     dist.destroy_process_group()
 
 
 def main():
-    def testcase(world_size=4, num_tokens=128, hidden_dim=1024, eps=1e-6):
+    def testcase(world_size=4, num_tokens=256, hidden_dim=1024, eps=1e-6):
         allreduce_in = torch.randn(world_size, num_tokens, hidden_dim)
         residual_in = torch.randn(num_tokens, hidden_dim)
         rms = RMSNorm(hidden_dim)

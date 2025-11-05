@@ -7,3 +7,7 @@ package_name = os.path.basename(this_dir)
 filename = os.path.join(os.path.dirname(this_dir), f"lib{package_name}.so")
 print("Loading extension from:", filename)
 torch.ops.load_library(filename)
+
+
+CommWorkspace = torch.classes.cgemm.CommWorkspace
+allreduce_rms_fusion = torch.ops.cgemm.allreduce_rms_fusion

@@ -14,10 +14,12 @@
 #if defined(__HIPCC__)
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_cooperative_groups.h>
 
+#define gpuSuccess hipSuccess
 #define gpuMemcpy hipMemcpy
 #define gpuMemset hipMemset
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
@@ -54,13 +56,22 @@
 
 #define __bfloat16 __hip_bfloat16
 
-#else
+#define gpuIpcMemHandle_t hipIpcMemHandle_t
+#define gpuIpcGetMemHandle hipIpcGetMemHandle
+#define gpuIpcOpenMemHandle hipIpcOpenMemHandle
+#define gpuIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
+
+#endif
+
+#if defined(__CUDACC__)
 
 #include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cooperative_groups.h>
 
+#define gpuSuccess cudaSuccess
 #define gpuMemcpy cudaMemcpy
 #define gpuMemset cudaMemset
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
@@ -96,5 +107,10 @@
 #define gpuLaunchCooperativeKernel cudaLaunchCooperativeKernel
 
 #define __bfloat16 __nv_bfloat16
+
+#define gpuIpcMemHandle_t cudaIpcMemHandle_t
+#define gpuIpcGetMemHandle cudaIpcGetMemHandle
+#define gpuIpcOpenMemHandle cudaIpcOpenMemHandle
+#define gpuIpcMemLazyEnablePeerAccess cudaIpcMemLazyEnablePeerAccess
 
 #endif
