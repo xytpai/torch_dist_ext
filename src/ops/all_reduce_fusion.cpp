@@ -1,6 +1,9 @@
 #include "all_reduce_fusion.h"
 #include "all_reduce_fusion_impl.h"
 
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+
 template <typename T>
 struct KernelElementType {
     using type = T;
@@ -17,6 +20,8 @@ struct KernelElementType<c10::BFloat16> {
 };
 
 void allreduce_rms_fusion(int64_t rank, int64_t nranks, Tensor &allreduce_in, Tensor &residual_in, Tensor &rms_gamma, Tensor &residual_out, Tensor &norm_out, double eps, Tensor &workspace) {
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(allreduce_in));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     int size = allreduce_in.numel();
     int hidden_dim = allreduce_in.size(-1);
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -47,6 +52,7 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
     size_in_bytes_ = size_in_bytes;
 
     int data_size = size_in_bytes * 2 + nblocks * world_size * 4;
+    // int data_size = nblocks * world_size * sizeof(int) + size_in_bytes * 2;
     gpuMalloc(&data_, data_size);
     gpuMemset(data_, 0, data_size);
 
@@ -96,6 +102,8 @@ void CommWorkspace::open_handles(std::vector<Tensor> handles) {
     for (int i = 0; i < world_size_; ++i) {
         twoshot_comm_bufs_[i] = ipc_data_[i];
         twoshot_barrier_flags_[i] = (int *)((char *)ipc_data_[i] + 2 * size_in_bytes_);
+        // twoshot_barrier_flags_[i] = (int*)ipc_data_[i];
+        // twoshot_comm_bufs_[i] = (void*)((char*)ipc_data_[i] + nblocks_ * world_size_ * sizeof(int));
     }
 }
 

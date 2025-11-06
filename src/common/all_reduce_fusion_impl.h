@@ -596,8 +596,8 @@ void allreduce_rms_fusion_impl(
         allreduce_fusion_kernel_launcher<T, 8>(params);
     } else if (nranks == 4) {
         allreduce_fusion_kernel_launcher<T, 4>(params);
-    } else if (nranks == 1) {
-        allreduce_fusion_kernel_launcher<T, 1>(params);
+    } else if (nranks == 2) {
+        allreduce_fusion_kernel_launcher<T, 2>(params);
     } else {
         TORCH_CHECK(false);
     }

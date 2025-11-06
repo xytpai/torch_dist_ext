@@ -2,8 +2,15 @@ import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
 import torch.distributed as dist
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 import torch_dist_ext
 
+import os
+envs = {  
+    "HIP_VISIBLE_DEVICES": "0,1,6,7",
+}
+for k,v in envs.items():
+    os.environ[k] = v
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, norm_eps=1e-6, dtype=torch.float):
@@ -23,31 +30,36 @@ def setup(rank, world_size):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend='nccl',
-        init_method='tcp://127.0.0.1:23456',
+        init_method='tcp://127.0.0.1:23457',
         rank=rank,
         world_size=world_size)
 
-
 def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, use_fused=True):
     setup(rank, world_size)
+    torch_dist_ext.setup_env(rank, world_size)
     num_tokens, hidden_dim = residual_in.shape
     local_allreduce_in = allreduce_in[rank].cuda(rank)
     local_residual_in = residual_in.cuda(rank)
     local_rms = rms.cuda(rank)
-    if not use_fused:
-        dist.all_reduce(local_allreduce_in)    
-        local_norm_out = local_rms(local_allreduce_in + local_residual_in)
-    else:
-        local_residual_out = torch.empty_like(local_residual_in)
-        local_norm_out = torch.empty_like(local_residual_in)
-        comm = torch_dist_ext.CommProcess(rank, world_size, residual_in.numel() * residual_in.element_size())
-        workspace = comm.workspace()
-        workspace = workspace.cuda(rank)
-        torch_dist_ext.allreduce_rms_fusion(rank, world_size, local_allreduce_in, local_residual_in, 
-            local_rms.weight.data, local_residual_out, local_norm_out, eps, workspace)
+    torch.cuda.synchronize()
+    dist.barrier()
+    prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ])
+    with prof:
+        if not use_fused:
+            dist.all_reduce(local_allreduce_in)    
+            local_norm_out = local_rms(local_allreduce_in + local_residual_in)
+        else:
+            local_norm_out, local_residual_out = torch_dist_ext.allreduce_rms_fusion_(rank, world_size, local_allreduce_in, local_residual_in, 
+                local_rms.weight.data, eps, torch_dist_ext.get_workspace())
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
     print(f"rank:{rank}, maxdiff:{maxdiff}")
     # assert torch.allclose(local_norm_out.cpu(), ref_norm_out)
+    if rank == 0:
+        print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10000))
     dist.destroy_process_group()
 
 
