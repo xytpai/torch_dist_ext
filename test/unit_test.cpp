@@ -1,4 +1,4 @@
-#include "all_reduce_fusion.h"
+#include "all_reduce_fusion_impl.h"
 
 namespace test {
 
@@ -13,11 +13,13 @@ public:
     void *residual_out;
     void *norm_out;
     void *rms_gamma;
+
     GPUInputs() :
         size(0), hidden_dim(0),
         allreduce_in(nullptr), residual_in(nullptr), residual_out(nullptr),
         norm_out(nullptr), rms_gamma(nullptr) {
     }
+
     void allocate(int rank, int size, int hidden_dim) {
         this->size = size;
         this->hidden_dim = hidden_dim;
@@ -30,6 +32,7 @@ public:
         gpuMalloc(&rms_gamma, hidden_dim * sizeof(T));
         gpuDeviceSynchronize();
     }
+
     ~GPUInputs() {
         gpuSetDevice(rank);
         gpuFree(allreduce_in);
@@ -43,79 +46,52 @@ public:
 
 template <typename T>
 class GPUCommWorkspace {
+    int nblocks;
     int rank;
     int nranks;
     int size;
 
 public:
-    int nblocks;
     int *counter;
-    // barrier
-    void *comm_bufs;
-    int *barrier_flags;
-    int *flag;
-    // lamport
-    void *lamport_data_bufs;
-    int *lamport_flag;
-    int *lamport_clear;
-    int *lamport_comm_size;
+    void *twoshot_comm_bufs;
+    int *twoshot_barrier_flags;
+    int *twoshot_sync_clock;
 
     GPUCommWorkspace() :
-        nblocks(NBLOCKS_PER_GPU), counter(nullptr),
-        comm_bufs(nullptr), barrier_flags(nullptr), flag(nullptr),
-        lamport_data_bufs(nullptr), lamport_flag(nullptr), lamport_clear(nullptr),
-        lamport_comm_size(nullptr) {
+        nblocks(NBLOCKS_PER_GPU),
+        counter(nullptr),
+        twoshot_comm_bufs(nullptr),
+        twoshot_barrier_flags(nullptr),
+        twoshot_sync_clock(nullptr) {
     }
+
     void allocate(int rank, int nranks, int size) {
         this->rank = rank;
         this->nranks = nranks;
         this->size = size;
         gpuSetDevice(rank);
         gpuMalloc(&counter, sizeof(int));
-        // barrier
-        gpuMalloc(&comm_bufs, 2 * size * sizeof(T));
-        gpuMalloc(&barrier_flags, nblocks * nranks * sizeof(int));
-        gpuMalloc(&flag, sizeof(int));
-        // lamport
-        gpuMalloc(&lamport_data_bufs, 3 * nranks * size * sizeof(T));
-        gpuMalloc(&lamport_flag, sizeof(int));
-        gpuMalloc(&lamport_clear, sizeof(int));
-        gpuMalloc(&lamport_comm_size, sizeof(int));
+        gpuMalloc(&twoshot_comm_bufs, 2 * size * sizeof(T));
+        gpuMalloc(&twoshot_barrier_flags, nblocks * nranks * sizeof(int));
+        gpuMalloc(&twoshot_sync_clock, sizeof(int));
         gpuDeviceSynchronize();
         reset();
     }
+
     void reset() {
         gpuSetDevice(rank);
-        // barrier
         gpuMemset(counter, 0, sizeof(int));
-        gpuMemset(barrier_flags, 0, nblocks * nranks * sizeof(int));
-        gpuMemset(flag, 0, sizeof(int));
-        // lamport
-        gpuMemset(lamport_flag, 0, sizeof(int));
-        int clear_size = nranks * size;
-        int comm_size = nranks * size * (int)sizeof(T);
-        gpuMemcpy(lamport_clear, &clear_size, sizeof(int), gpuMemcpyHostToDevice);
-        gpuMemcpy(lamport_comm_size, &comm_size, sizeof(int), gpuMemcpyHostToDevice);
-        T *lamport_data_bufs_ = new T[3 * nranks * size];
-        for (int i = 0; i < 3 * nranks * size; ++i) {
-            lamport_data_bufs_[i] = allreduce_fusion::neg_zero_v<T>;
-        }
-        gpuMemcpy(lamport_data_bufs, lamport_data_bufs_, 3 * nranks * size * sizeof(T), gpuMemcpyHostToDevice);
-        delete[] lamport_data_bufs_;
+        gpuMemset(twoshot_barrier_flags, 0, nblocks * nranks * sizeof(int));
+        gpuMemset(twoshot_sync_clock, 0, sizeof(int));
         gpuDeviceSynchronize();
     }
+
     ~GPUCommWorkspace() {
         gpuSetDevice(rank);
         gpuFree(counter);
-        // barrier
-        gpuFree(comm_bufs);
-        gpuFree(barrier_flags);
-        gpuFree(flag);
-        // lamport
-        gpuFree(lamport_data_bufs);
-        gpuFree(lamport_flag);
-        gpuFree(lamport_clear);
-        gpuFree(lamport_comm_size);
+        gpuFree(twoshot_comm_bufs);
+        gpuFree(twoshot_barrier_flags);
+        gpuFree(twoshot_sync_clock);
         gpuDeviceSynchronize();
     }
 };
@@ -126,6 +102,7 @@ public:
     GPUWorkSpace() :
         workspace_(nullptr) {
     }
+
     void init(std::vector<GPUCommWorkspace<T>> &rs, int rank) {
         gpuSetDevice(rank);
         rank_ = rank;
@@ -133,25 +110,22 @@ public:
         auto &r = rs[rank];
         std::vector<void *> workspace(nranks * 3 + 5);
         for (int peer = 0; peer < nranks; ++peer) {
-            workspace[peer] = (void *)rs[peer].comm_bufs;
-            workspace[nranks + peer] = (void *)rs[peer].barrier_flags;
-            // lamport
-            workspace[2 * nranks + peer] = (void *)rs[peer].lamport_data_bufs;
+            workspace[peer] = (void *)rs[peer].twoshot_comm_bufs;
+            workspace[nranks + peer] = (void *)rs[peer].twoshot_barrier_flags;
         }
         workspace[nranks * 3 + 0] = (void *)r.counter;
-        workspace[nranks * 3 + 1] = (void *)r.flag;
-        workspace[nranks * 3 + 2] = (void *)r.lamport_flag;
-        workspace[nranks * 3 + 3] = (void *)r.lamport_comm_size;
-        workspace[nranks * 3 + 4] = (void *)r.lamport_clear;
+        workspace[nranks * 3 + 1] = (void *)r.twoshot_sync_clock;
         gpuMalloc(&workspace_, workspace.size() * sizeof(void *));
         gpuMemcpy(workspace_, workspace.data(), workspace.size() * sizeof(void *), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
     }
+
     ~GPUWorkSpace() {
         gpuSetDevice(rank_);
         gpuFree(workspace_);
         gpuDeviceSynchronize();
     }
+
     void **workspace() const {
         return workspace_;
     }

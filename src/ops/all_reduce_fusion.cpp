@@ -41,7 +41,8 @@ void allreduce_rms_fusion(int64_t rank, int64_t nranks, Tensor &allreduce_in, Te
                 (void *)residual_out.data_ptr<scalar_t>(),
                 (void *)norm_out.data_ptr<scalar_t>(),
                 (void *)rms_gamma.data_ptr<scalar_t>(),
-                eps);
+                eps,
+                stream);
         });
 }
 
@@ -51,23 +52,20 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
     nblocks_ = nblocks;
     size_in_bytes_ = size_in_bytes;
 
-    int data_size = size_in_bytes * 2 + nblocks * world_size * 4;
-    // int data_size = nblocks * world_size * sizeof(int) + size_in_bytes * 2;
+    int data_size = size_in_bytes * 2 + nblocks * world_size * sizeof(int);
     gpuMalloc(&data_, data_size);
     gpuMemset(data_, 0, data_size);
 
     gpuMalloc(&counter_, sizeof(int));
-    gpuMalloc(&twoshot_sync_clock_, sizeof(int));
-    gpuMalloc(&oneshot_sync_clock_, sizeof(int));
     gpuMemset(counter_, 0, sizeof(int));
+
+    gpuMalloc(&twoshot_sync_clock_, sizeof(int));
     gpuMemset(twoshot_sync_clock_, 0, sizeof(int));
-    gpuMemset(oneshot_sync_clock_, 0, sizeof(int));
 }
 
 CommWorkspace::~CommWorkspace() {
     gpuFree(counter_);
     gpuFree(twoshot_sync_clock_);
-    gpuFree(oneshot_sync_clock_);
     gpuFree(data_);
 }
 
@@ -102,8 +100,6 @@ void CommWorkspace::open_handles(std::vector<Tensor> handles) {
     for (int i = 0; i < world_size_; ++i) {
         twoshot_comm_bufs_[i] = ipc_data_[i];
         twoshot_barrier_flags_[i] = (int *)((char *)ipc_data_[i] + 2 * size_in_bytes_);
-        // twoshot_barrier_flags_[i] = (int*)ipc_data_[i];
-        // twoshot_comm_bufs_[i] = (void*)((char*)ipc_data_[i] + nblocks_ * world_size_ * sizeof(int));
     }
 }
 
@@ -112,13 +108,9 @@ Tensor CommWorkspace::get_workspace() {
     for (int peer = 0; peer < world_size_; ++peer) {
         workspace[peer] = (void *)twoshot_comm_bufs_[peer];
         workspace[world_size_ + peer] = (void *)twoshot_barrier_flags_[peer];
-        workspace[2 * world_size_ + peer] = (void *)oneshot_comm_bufs_[peer];
     }
     workspace[world_size_ * 3 + 0] = (void *)counter_;
     workspace[world_size_ * 3 + 1] = (void *)twoshot_sync_clock_;
-    workspace[world_size_ * 3 + 2] = (void *)oneshot_sync_clock_;
-    // workspace[world_size_ * 3 + 3] = (void *)r.lamport_comm_size;
-    // workspace[world_size_ * 3 + 4] = (void *)r.lamport_clear;
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
     auto workspace_tensor = torch::empty({static_cast<int64_t>(workspace.size() * sizeof(void *))}, options);
     std::memcpy(workspace_tensor.data_ptr(), workspace.data(), workspace.size() * sizeof(void *));

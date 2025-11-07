@@ -31,9 +31,6 @@ private:
     void *twoshot_comm_bufs_[MAX_RNAKS];    // 2 * size * sizeof(T)
     int *twoshot_barrier_flags_[MAX_RNAKS]; // nblocks * world_size
     int *twoshot_sync_clock_;
-    // oneshot
-    void *oneshot_comm_bufs_[MAX_RNAKS];
-    int *oneshot_sync_clock_;
 };
 
 void allreduce_rms_fusion(int64_t rank, int64_t nranks, at::Tensor &allreduce_in,

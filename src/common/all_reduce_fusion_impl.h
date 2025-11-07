@@ -19,7 +19,6 @@ namespace allreduce_fusion {
 namespace details {
 
 static constexpr int kBytesPerAccess = 16;
-static constexpr int kOneShotMaxToken = 128;
 
 } // namespace details
 
@@ -99,46 +98,6 @@ struct SyncComm {
 };
 
 template <int NRanks>
-struct LamportComm {
-    __device__ __forceinline__ LamportComm(void **workspace, int rank) {
-        counter_ptr = (int *)workspace[NRanks * 3 + 0];
-        flag_ptr = (int *)workspace[NRanks * 3 + 2];
-        clear_ptr = (int *)workspace[NRanks * 3 + 4];
-        flag_value = *flag_ptr;
-        int comm_size = *reinterpret_cast<int *>(workspace[NRanks * 3 + 3]);
-        clear_size = *clear_ptr;
-        int data_offset = flag_value % 3;
-        int clear_offset = (flag_value + 2) % 3;
-        for (int r = 0; r < NRanks; ++r) {
-            data_bufs[r] = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + r]) + static_cast<int64_t>(data_offset) * comm_size;
-        }
-        clear_buf = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            atomicAdd(counter_ptr, 1);
-        }
-    }
-
-    __device__ __forceinline__ void update(int new_clear_size) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
-            while (atomicAdd(counter_ptr, 0) != gridDim.x) {
-            }
-            *flag_ptr = (flag_value + 1) % 3;
-            *clear_ptr = new_clear_size;
-            *counter_ptr = 0;
-        }
-    }
-
-    int *counter_ptr;
-    int *flag_ptr;
-    int *clear_ptr;
-    uint8_t *data_bufs[NRanks];
-    uint8_t *clear_buf;
-    int clear_size;
-    int flag_value;
-};
-
-template <int NRanks>
 class Barrier {
 public:
     __device__ __forceinline__ Barrier(int rank, SyncComm<NRanks> const &comm) {
@@ -172,7 +131,10 @@ protected:
 #ifdef __CUDACC__
         asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr));
 #else
-        __hip_atomic_store(addr, flag, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        __scoped_atomic_store_n(addr,
+                                flag,
+                                __ATOMIC_RELEASE,
+                                __MEMORY_SCOPE_SYSTEM);
 #endif
     }
 
@@ -183,7 +145,9 @@ protected:
                      : "=r"(flag)
                      : "l"(addr));
 #else
-        flag = __hip_atomic_load(addr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+        flag = __scoped_atomic_load_n(addr,
+                                      __ATOMIC_ACQUIRE,
+                                      __MEMORY_SCOPE_SYSTEM);
 #endif
         return flag;
     }
@@ -238,11 +202,6 @@ __device__ __forceinline__ void vec_add_(vec_t<T, VEC_SIZE> &self,
     }
 }
 
-enum QuantType {
-    None = 0,
-    FP8,
-};
-
 template <typename T>
 struct AllReduceFusionParams {
     int nranks;
@@ -257,237 +216,49 @@ struct AllReduceFusionParams {
     void *rms_gamma;
     float rms_eps;
     float scale_factor;
-    // quant config
-    QuantType quant_type;
 };
 
-template <typename T>
-class FusedOp {
-    static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-
-public:
-    __device__ __forceinline__ FusedOp(AllReduceFusionParams<T> const &params, int access_id,
-                                       int access_id_in_token) :
-        m_params(params),
-        m_access_id(access_id), m_access_id_in_token(access_id_in_token) {
-        m_gamma_val.load(reinterpret_cast<T *>(params.rms_gamma) + m_access_id_in_token);
-        m_residual_val.load(reinterpret_cast<T *>(params.residual_in) + m_access_id);
-        if (params.quant_type == QuantType::FP8) {
-            m_scale_factor = 1.f / (params.scale_factor);
-        }
-    }
-
-    __device__ __forceinline__ void update(int access_id) {
-        if (m_access_id != access_id) {
-            m_access_id = access_id;
-            m_residual_val.load(reinterpret_cast<T *>(m_params.residual_in) + m_access_id);
-        }
-    }
-
-    __device__ __forceinline__ void operator()(vec_t<T, VEC_SIZE> val, int token_id) {
-        // val.store(reinterpret_cast<T *>(m_params.allreduce_out) + m_access_id * VEC_SIZE);
-        vec_add_<T, VEC_SIZE>(val, m_residual_val);
-        val.store(reinterpret_cast<T *>(m_params.residual_out) + m_access_id);
-        val = rms_norm(val, m_gamma_val);
-        val.store(reinterpret_cast<T *>(m_params.norm_out) + m_access_id);
-        //         if (m_params.quant_type == QuantType::FP8) {
-        //             using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
-        //             PackedQuantizedType ret;
-        // #pragma unroll
-        //             for (int i = 0; i < VEC_SIZE; ++i) {
-        //                 reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-        //                     static_cast<float>(reinterpret_cast<T*>(&val)[i]) * m_scale_factor);
-        //             }
-        //             reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
-        //         }
-    }
-
-protected:
-    __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const &residual,
-                                                           vec_t<T, VEC_SIZE> const &gamma) {
-        __shared__ float s_val;
-        vec_t<T, VEC_SIZE> norm_out;
-        float acc = 0.f;
-#pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i) {
-            float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
-            acc += v * v;
-        }
-        acc = block_utils::block_reduce_sum<float>(acc);
-        if (threadIdx.x == 0) {
-            s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
-        }
-        __syncthreads();
-#pragma unroll
-        for (int i = 0; i < VEC_SIZE; ++i) {
-            reinterpret_cast<T *>(&norm_out)[i] =
-                static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&residual)[i]) * s_val * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
-        }
-        return norm_out;
-    }
-
-private:
-    AllReduceFusionParams<T> const &m_params;
-    int m_access_id;
-    int m_access_id_in_token;
-    float m_scale_factor;
-    vec_t<T, VEC_SIZE> m_residual_val;
-    vec_t<T, VEC_SIZE> m_gamma_val;
-};
-
-template <typename T>
-struct neg_zero {
-    static constexpr T value = -T(0);
-};
-
-template <>
-struct neg_zero<__half> {
-    static constexpr unsigned short neg_zero_bits = 0x8000U;
-    static constexpr __half value = __half_raw{neg_zero_bits};
-};
-
-template <>
-struct neg_zero<__bfloat16> {
-    static constexpr unsigned short neg_zero_bits = 0x8000U;
-    static constexpr __bfloat16 value = __hip_bfloat16_raw{neg_zero_bits};
-};
-
-template <>
-struct neg_zero<float> {
-    static constexpr unsigned int neg_zero_bits = 0x80000000U;
-    static constexpr float value = -0.0f;
-};
-
-template <typename T>
-__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T>
-__device__ bool is_negative_zero(T) {
-    return false;
-}
-
-// float specialization
-template <>
-__device__ bool is_negative_zero<float>(float x) {
-    return (__float_as_int(x) == 0x80000000);
-}
-
-// double specialization
-template <>
-__device__ bool is_negative_zero<double>(double x) {
-    return (__double_as_longlong(x) == 0x8000000000000000ULL);
-}
-
-// __half specialization
-template <>
-__device__ bool is_negative_zero<__half>(__half x) {
-    return (__half_as_ushort(x) == 0x8000);
-}
-
-// __bfloat16 specialization
-template <>
-__device__ bool is_negative_zero<__bfloat16>(__bfloat16 x) {
-    return (__bfloat16_as_ushort(x) == 0x8000);
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE> &vec) {
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(
+    AllReduceFusionParams<T> const &m_params,
+    vec_t<T, VEC_SIZE> const &residual,
+    vec_t<T, VEC_SIZE> const &gamma) {
+    __shared__ float s_val;
+    vec_t<T, VEC_SIZE> norm_out;
+    float acc = 0.f;
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-        if (is_negative_zero(vec[i])) {
-            return true;
-        }
+        float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
+        acc += v * v;
     }
-    return false;
-}
-
-template <typename T, uint32_t VEC_SIZE>
-__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE> &vec) {
+    acc = block_utils::block_reduce_sum<float>(acc);
+    if (threadIdx.x == 0) {
+        s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
+    }
+    __syncthreads();
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
-        vec[i] = (is_negative_zero(vec[i])) ? static_cast<T>(0.f) : vec[i];
+        reinterpret_cast<T *>(&norm_out)[i] =
+            static_cast<T>(static_cast<float>(reinterpret_cast<T const *>(&residual)[i]) * s_val * static_cast<float>(reinterpret_cast<T const *>(&gamma)[i]));
     }
+    return norm_out;
 }
 
 template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
+__global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> params) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-    int token_id = blockIdx.x;
+
     int access_id_in_token = threadIdx.x * VEC_SIZE;
-    int access_id = token_id * params.hidden_dim + access_id_in_token;
-    int access_stride = gridDim.x * params.hidden_dim;
-    vec_t<T, VEC_SIZE> clear_vec;
-    clear_vec.fill(neg_zero_v<T>);
-    FusedOp<T> fused_op(params, access_id, access_id_in_token);
+    int access_id_begin = (blockIdx.x * NRanks + 0) * params.hidden_dim + access_id_in_token;
 
-    comm::LamportComm<NRanks> comm(params.workspace, params.rank);
+    vec_t<T, VEC_SIZE> gamma;
+    gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
 
-    for (
-        int idx = access_id;
-        idx < params.size;
-        idx += access_stride) {
-        vec_t<T, VEC_SIZE> val;
-        val.load(reinterpret_cast<T *>(params.allreduce_in) + idx);
-        remove_neg_zero<T, VEC_SIZE>(val);
-#pragma unroll
-        for (int r = 0; r < NRanks; ++r) {
-            // Push data to other ranks
-            val.store(reinterpret_cast<T *>(comm.data_bufs[r]) + params.rank * params.size + idx);
-        }
-    }
-
-    for (int idx = access_id; idx < comm.clear_size; idx += access_stride) {
-        // Clear comm buffer that previous kernel used
-        clear_vec.store(reinterpret_cast<T *>(comm.clear_buf) + idx);
-    }
-
-    for (
-        int idx = access_id, tidx = token_id;
-        idx < params.size;
-        idx += access_stride, tidx += gridDim.x) {
-        fused_op.update(idx);
-        vec_t<T, VEC_SIZE> vals[NRanks];
-        volatile bool done = false;
-        while (!done) {
-            done = true;
-            __threadfence();
-#pragma unroll
-            for (int r = 0; r < NRanks; ++r) {
-                // LDG.128 from local rank
-                vals[r].load(reinterpret_cast<T *>(comm.data_bufs[params.rank]) + r * params.size + idx);
-                done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
-            }
-        }
-
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r) {
-            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
-        }
-
-        fused_op(vals[0], tidx);
-    }
-
-    comm.update(params.size * NRanks);
-}
-
-template <typename T, int NRanks>
-__global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> params,
-                                                     std::array<int, NRanks> begin_tokens,
-                                                     std::array<int, NRanks> token_num_per_ranks) {
-    static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
-    int token_id = blockIdx.x;
-    int access_id_in_token = threadIdx.x * VEC_SIZE;
-    int access_id = token_id * params.hidden_dim + access_id_in_token;
-    int access_stride = gridDim.x * params.hidden_dim;
-    FusedOp<T> fused_op(params, access_id, access_id_in_token);
     comm::SyncComm<NRanks> comm(params.workspace);
 
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-        for (
-            int idx = begin_tokens[r] * params.hidden_dim + access_id;
-            idx < (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim;
-            idx += access_stride) {
+        for (int idx = (blockIdx.x * NRanks + r) * params.hidden_dim + access_id_in_token; idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim) {
             reinterpret_cast<float4 *>(comm.comm_bufs[params.rank])[idx / VEC_SIZE] =
                 reinterpret_cast<float4 *>(params.allreduce_in)[idx / VEC_SIZE];
         }
@@ -496,12 +267,8 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
     comm::Barrier<NRanks> barrier(params.rank, comm);
     barrier.sync();
 
-    int comm_access_id = access_id + begin_tokens[params.rank] * params.hidden_dim / VEC_SIZE;
-    int comm_tot_access = (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim / VEC_SIZE;
-    for (
-        int idx = begin_tokens[params.rank] * params.hidden_dim + access_id;
-        idx < (begin_tokens[params.rank] + token_num_per_ranks[params.rank]) * params.hidden_dim;
-        idx += access_stride) {
+    // allreduce
+    for (int idx = (blockIdx.x * NRanks + params.rank) * params.hidden_dim + access_id_in_token; idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim) {
         vec_t<T, VEC_SIZE> vals[NRanks];
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
@@ -521,15 +288,15 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
 
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
-        for (
-            int idx = begin_tokens[r] * params.hidden_dim + access_id, tidx = begin_tokens[r] + token_id;
-            idx < (begin_tokens[r] + token_num_per_ranks[r]) * params.hidden_dim;
-            idx += access_stride, tidx += gridDim.x) {
-            fused_op.update(idx);
-            vec_t<T, VEC_SIZE> sum_val;
-            sum_val.load(reinterpret_cast<T *>(comm.comm_bufs[params.rank]) + params.size + idx);
-            sum_val.store(reinterpret_cast<T *>(params.residual_out) + idx);
-            fused_op(sum_val, tidx);
+        int token_id = blockIdx.x * NRanks + r;
+        for (int idx = token_id * params.hidden_dim + access_id_in_token; idx < params.size; idx += gridDim.x * NRanks * params.hidden_dim) {
+            vec_t<T, VEC_SIZE> data[2];
+            data[0].load(reinterpret_cast<T *>(params.residual_in) + idx);
+            data[1].load(reinterpret_cast<T *>(comm.comm_bufs[params.rank]) + params.size + idx);
+            vec_add_<T, VEC_SIZE>(data[0], data[1]);
+            data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
+            auto val = rms_norm<T, VEC_SIZE>(params, data[0], gamma);
+            val.store(reinterpret_cast<T *>(params.norm_out) + idx);
         }
     }
 
@@ -537,34 +304,16 @@ __global__ void allreduce_fusion_kernel_twoshot_sync(AllReduceFusionParams<T> pa
 }
 
 template <typename T, int NRanks>
-void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params) {
+void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gpuStream_t stream) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
     assert(params.size % params.hidden_dim == 0);
     assert(params.hidden_dim % VEC_SIZE == 0);
     int token_num = params.size / params.hidden_dim;
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     int threads_per_block = threads_per_token;
-
-    // if (token_num <= details::kOneShotMaxToken) {
-    //     if (params.rank == 0) std::cout << "using oneshot\n";
-    //     dim3 threadsPerBlock(threads_per_block);
-    //     dim3 numBlocks(NBLOCKS_PER_GPU);
-    //     allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock>>>(params);
-    //     return;
-    // }
-
-    std::array<int, NRanks> begin_tokens, token_num_per_ranks;
-    int remaining_token = token_num % NRanks;
-    int token_num_per_rank = token_num / NRanks;
-    for (int r = 0; r < NRanks; ++r) {
-        begin_tokens[r] = r * token_num_per_rank + (remaining_token > r ? r : remaining_token);
-        token_num_per_ranks[r] = token_num_per_rank + (remaining_token > r ? 1 : 0);
-    }
-
     dim3 threadsPerBlock(threads_per_block);
     dim3 numBlocks(NBLOCKS_PER_GPU);
-    // if (params.rank == 0) std::cout << "using twoshot\n";
-    allreduce_fusion_kernel_twoshot_sync<T, NRanks><<<numBlocks, threadsPerBlock>>>(params, begin_tokens, token_num_per_ranks);
+    allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
 }
 
 template <typename T>
@@ -579,7 +328,8 @@ void allreduce_rms_fusion_impl(
     void *residual_out,
     void *norm_out,
     void *rms_gamma,
-    float eps) {
+    float eps,
+    gpuStream_t stream = 0) {
     allreduce_fusion::AllReduceFusionParams<T> params;
     params.nranks = nranks;
     params.rank = rank;
@@ -593,13 +343,13 @@ void allreduce_rms_fusion_impl(
     params.rms_gamma = rms_gamma;
     params.rms_eps = eps;
     if (nranks == 8) {
-        allreduce_fusion_kernel_launcher<T, 8>(params);
+        allreduce_fusion_kernel_launcher<T, 8>(params, stream);
     } else if (nranks == 4) {
-        allreduce_fusion_kernel_launcher<T, 4>(params);
+        allreduce_fusion_kernel_launcher<T, 4>(params, stream);
     } else if (nranks == 2) {
-        allreduce_fusion_kernel_launcher<T, 2>(params);
+        allreduce_fusion_kernel_launcher<T, 2>(params, stream);
     } else {
-        TORCH_CHECK(false);
+        assert(false);
     }
 }
 

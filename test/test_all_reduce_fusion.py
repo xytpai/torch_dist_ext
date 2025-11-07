@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.multiprocessing as mp
@@ -5,12 +6,13 @@ import torch.distributed as dist
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 import torch_dist_ext
 
-import os
+
 envs = {  
     "HIP_VISIBLE_DEVICES": "0,1,6,7",
 }
 for k,v in envs.items():
     os.environ[k] = v
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, norm_eps=1e-6, dtype=torch.float):
@@ -34,6 +36,7 @@ def setup(rank, world_size):
         rank=rank,
         world_size=world_size)
 
+
 def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, use_fused=True):
     setup(rank, world_size)
     torch_dist_ext.setup_env(rank, world_size)
@@ -53,7 +56,7 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, 
             dist.all_reduce(local_allreduce_in)    
             local_norm_out = local_rms(local_allreduce_in + local_residual_in)
         else:
-            local_norm_out, local_residual_out = torch_dist_ext.allreduce_rms_fusion_(rank, world_size, local_allreduce_in, local_residual_in, 
+            local_norm_out, local_residual_out = torch_dist_ext.allreduce_rms(rank, world_size, local_allreduce_in, local_residual_in, 
                 local_rms.weight.data, eps, torch_dist_ext.get_workspace())
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
     print(f"rank:{rank}, maxdiff:{maxdiff}")
