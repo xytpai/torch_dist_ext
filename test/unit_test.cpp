@@ -101,7 +101,8 @@ public:
         gpuMemset(oneshot_sync_clock, 0, sizeof(int));
         int clear_size = nranks * size;
         int comm_size = nranks * size * (int)sizeof(T); // large size
-        gpuMemcpy(oneshot_clear, &clear_size, sizeof(int), gpuMemcpyHostToDevice);
+        // gpuMemcpy(oneshot_clear, &clear_size, sizeof(int), gpuMemcpyHostToDevice);
+        gpuMemset(oneshot_clear, 0, sizeof(int));
         gpuMemcpy(oneshot_comm_size, &comm_size, sizeof(int), gpuMemcpyHostToDevice);
         T *lamport_data_bufs_ = new T[3 * nranks * size];
         for (int i = 0; i < 3 * nranks * size; ++i) {
