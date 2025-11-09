@@ -14,7 +14,6 @@ using namespace std;
 namespace cg = cooperative_groups;
 
 #define NBLOCKS_PER_GPU 256
-#define DEFAULT_NCTAS 256
 
 namespace allreduce_fusion {
 
@@ -114,7 +113,7 @@ public:
     }
 
     __device__ __forceinline__ void sync() {
-        constexpr int kBarrierFlagCount = DEFAULT_NCTAS;
+        constexpr int kBarrierFlagCount = NBLOCKS_PER_GPU;
         __syncthreads();
         if (threadIdx.x < NRanks) {
             m_flag_value = next_flag(m_flag_value);
