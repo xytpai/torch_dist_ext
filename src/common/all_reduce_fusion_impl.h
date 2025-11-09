@@ -8,6 +8,8 @@
 #include <chrono>
 
 #include "collectives.h"
+#include "negzero.h"
+
 using namespace std;
 namespace cg = cooperative_groups;
 
@@ -19,6 +21,7 @@ namespace allreduce_fusion {
 namespace details {
 
 static constexpr int kBytesPerAccess = 16;
+static constexpr int kOneShotMaxToken = 128;
 
 } // namespace details
 
@@ -168,6 +171,46 @@ private:
     int *m_current_flag;
 };
 
+template <int NRanks>
+struct LamportComm {
+    __device__ __forceinline__ LamportComm(void **workspace, int rank) {
+        counter_ptr = (int *)workspace[NRanks * 3 + 0];
+        flag_ptr = (int *)workspace[NRanks * 3 + 2];
+        int comm_size = *reinterpret_cast<int *>(workspace[NRanks * 3 + 3]);
+        clear_ptr = (int *)workspace[NRanks * 3 + 4];
+        flag_value = *flag_ptr;
+        clear_size = *clear_ptr;
+        int data_offset = flag_value % 3;
+        int clear_offset = (flag_value + 2) % 3;
+        for (int r = 0; r < NRanks; ++r) {
+            data_bufs[r] = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + r]) + static_cast<int64_t>(data_offset) * comm_size;
+        }
+        clear_buf = reinterpret_cast<uint8_t *>(workspace[2 * NRanks + rank]) + clear_offset * comm_size;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            atomicAdd(counter_ptr, 1);
+        }
+    }
+
+    __device__ __forceinline__ void update(int new_clear_size) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            while (atomicAdd(counter_ptr, 0) != gridDim.x) {
+            }
+            *flag_ptr = (flag_value + 1) % 3;
+            *clear_ptr = new_clear_size;
+            *counter_ptr = 0;
+        }
+    }
+
+    int *counter_ptr;
+    int *flag_ptr;
+    int *clear_ptr;
+    uint8_t *data_bufs[NRanks];
+    uint8_t *clear_buf;
+    int clear_size;
+    int flag_value;
+};
+
 } // namespace comm
 
 template <typename T, int vec_size>
@@ -303,6 +346,89 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
     comm.update(barrier.m_flag_value);
 }
 
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ bool has_neg_zero(const vec_t<T, VEC_SIZE> &vec) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        if (is_negative_zero(vec[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename T, uint32_t VEC_SIZE>
+__device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE> &vec) {
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        vec[i] = (is_negative_zero(vec[i])) ? static_cast<T>(0.f) : vec[i];
+    }
+}
+
+template <typename T, int NRanks>
+__global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T> params) {
+    static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+    int token_id = blockIdx.x;
+    int access_id_in_token = threadIdx.x * VEC_SIZE;
+    int access_id = token_id * params.hidden_dim + access_id_in_token;
+    int access_stride = gridDim.x * params.hidden_dim;
+
+    vec_t<T, VEC_SIZE> clear_vec;
+    clear_vec.fill(neg_zero_v<T>);
+
+    vec_t<T, VEC_SIZE> gamma;
+    gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
+
+    comm::LamportComm<NRanks> comm(params.workspace, params.rank);
+    int clear_access = comm.clear_size / VEC_SIZE;
+
+    for (int idx = access_id; idx < params.size; idx += access_stride) {
+        vec_t<T, VEC_SIZE> val;
+        val.load(reinterpret_cast<T *>(params.allreduce_in) + idx);
+        remove_neg_zero<T, VEC_SIZE>(val);
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r) {
+            // Push data to other ranks
+            val.store(reinterpret_cast<T *>(comm.data_bufs[r]) + params.rank * params.size + idx);
+        }
+    }
+
+    for (int idx = access_id; idx < clear_access; idx += access_stride) {
+        // Clear comm buffer that previous kernel used
+        clear_vec.store(reinterpret_cast<T *>(comm.clear_buf) + idx);
+    }
+
+    for (int idx = access_id, tidx = token_id; idx < params.size; idx += access_stride, tidx += gridDim.x) {
+        vec_t<T, VEC_SIZE> residual;
+        residual.load(reinterpret_cast<T *>(params.residual_in) + idx);
+
+        vec_t<T, VEC_SIZE> vals[NRanks];
+        volatile bool done = false;
+        while (!done) {
+            done = true;
+            __threadfence();
+#pragma unroll
+            for (int r = 0; r < NRanks; ++r) {
+                // LDG.128 from local rank
+                vals[r].load(reinterpret_cast<T *>(comm.data_bufs[params.rank]) + r * params.size + idx);
+                done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
+            }
+        }
+
+#pragma unroll
+        for (int r = 1; r < NRanks; ++r) {
+            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
+        }
+
+        vec_add_<T, VEC_SIZE>(vals[0], residual);
+        vals[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
+        auto val = rms_norm<T, VEC_SIZE>(params, vals[0], gamma);
+        val.store(reinterpret_cast<T *>(params.norm_out) + idx);
+    }
+
+    comm.update(params.size * NRanks);
+}
+
 template <typename T, int NRanks>
 void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gpuStream_t stream) {
     static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
@@ -313,7 +439,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gp
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
     dim3 numBlocks(NBLOCKS_PER_GPU);
-    allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    if (token_num <= details::kOneShotMaxToken) {
+        allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    } else {
+        allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    }
 }
 
 template <typename T>

@@ -56,13 +56,22 @@ public:
     void *twoshot_comm_bufs;
     int *twoshot_barrier_flags;
     int *twoshot_sync_clock;
+    // oneshot
+    void *oneshot_comm_bufs;
+    int *oneshot_sync_clock;
+    int *oneshot_clear;
+    int *oneshot_comm_size;
 
     GPUCommWorkspace() :
         nblocks(NBLOCKS_PER_GPU),
         counter(nullptr),
         twoshot_comm_bufs(nullptr),
         twoshot_barrier_flags(nullptr),
-        twoshot_sync_clock(nullptr) {
+        twoshot_sync_clock(nullptr),
+        oneshot_comm_bufs(nullptr),
+        oneshot_sync_clock(nullptr),
+        oneshot_clear(nullptr),
+        oneshot_comm_size(nullptr) {
     }
 
     void allocate(int rank, int nranks, int size) {
@@ -74,6 +83,11 @@ public:
         gpuMalloc(&twoshot_comm_bufs, 2 * size * sizeof(T));
         gpuMalloc(&twoshot_barrier_flags, nblocks * nranks * sizeof(int));
         gpuMalloc(&twoshot_sync_clock, sizeof(int));
+        // oneshot
+        gpuMalloc(&oneshot_comm_bufs, 3 * nranks * size * sizeof(T));
+        gpuMalloc(&oneshot_sync_clock, sizeof(int));
+        gpuMalloc(&oneshot_clear, sizeof(int));
+        gpuMalloc(&oneshot_comm_size, sizeof(int));
         gpuDeviceSynchronize();
         reset();
     }
@@ -83,6 +97,18 @@ public:
         gpuMemset(counter, 0, sizeof(int));
         gpuMemset(twoshot_barrier_flags, 0, nblocks * nranks * sizeof(int));
         gpuMemset(twoshot_sync_clock, 0, sizeof(int));
+        // oneshot
+        gpuMemset(oneshot_sync_clock, 0, sizeof(int));
+        int clear_size = nranks * size;
+        int comm_size = nranks * size * (int)sizeof(T); // large size
+        gpuMemcpy(oneshot_clear, &clear_size, sizeof(int), gpuMemcpyHostToDevice);
+        gpuMemcpy(oneshot_comm_size, &comm_size, sizeof(int), gpuMemcpyHostToDevice);
+        T *lamport_data_bufs_ = new T[3 * nranks * size];
+        for (int i = 0; i < 3 * nranks * size; ++i) {
+            lamport_data_bufs_[i] = neg_zero_v<T>;
+        }
+        gpuMemcpy(oneshot_comm_bufs, lamport_data_bufs_, 3 * nranks * size * sizeof(T), gpuMemcpyHostToDevice);
+        delete[] lamport_data_bufs_;
         gpuDeviceSynchronize();
     }
 
@@ -92,6 +118,11 @@ public:
         gpuFree(twoshot_comm_bufs);
         gpuFree(twoshot_barrier_flags);
         gpuFree(twoshot_sync_clock);
+        // oneshot
+        gpuFree(oneshot_comm_bufs);
+        gpuFree(oneshot_sync_clock);
+        gpuFree(oneshot_clear);
+        gpuFree(oneshot_comm_size);
         gpuDeviceSynchronize();
     }
 };
@@ -112,9 +143,14 @@ public:
         for (int peer = 0; peer < nranks; ++peer) {
             workspace[peer] = (void *)rs[peer].twoshot_comm_bufs;
             workspace[nranks + peer] = (void *)rs[peer].twoshot_barrier_flags;
+            // oneshot
+            workspace[2 * nranks + peer] = (void *)rs[peer].oneshot_comm_bufs;
         }
         workspace[nranks * 3 + 0] = (void *)r.counter;
         workspace[nranks * 3 + 1] = (void *)r.twoshot_sync_clock;
+        workspace[nranks * 3 + 2] = (void *)r.oneshot_sync_clock;
+        workspace[nranks * 3 + 3] = (void *)r.oneshot_comm_size;
+        workspace[nranks * 3 + 4] = (void *)r.oneshot_clear;
         gpuMalloc(&workspace_, workspace.size() * sizeof(void *));
         gpuMemcpy(workspace_, workspace.data(), workspace.size() * sizeof(void *), gpuMemcpyHostToDevice);
         gpuDeviceSynchronize();
