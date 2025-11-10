@@ -21,6 +21,7 @@ namespace details {
 
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
+static constexpr int kOneShotMaxSize = kOneShotMaxToken * 1024 * kBytesPerAccess;
 
 } // namespace details
 
@@ -338,6 +339,11 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
             data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
             auto val = rms_norm<T, VEC_SIZE>(params, data[0], gamma);
+            // #pragma unroll
+            //             for (int i = 0; i < VEC_SIZE; ++i) {
+            //                 reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
+            //                     static_cast<float>(val[i]) * m_scale_factor);
+            //             }
             val.store(reinterpret_cast<T *>(params.norm_out) + idx);
         }
     }
@@ -379,7 +385,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
 
     comm::LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = comm.clear_size / VEC_SIZE;
+    int clear_access = comm.clear_size;
 
     for (int idx = access_id; idx < params.size; idx += access_stride) {
         vec_t<T, VEC_SIZE> val;
@@ -438,11 +444,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gp
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
     dim3 numBlocks(NBLOCKS_PER_GPU);
-    if (token_num <= details::kOneShotMaxToken) {
-        allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
-    } else {
-        allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
-    }
+    // if (token_num <= details::kOneShotMaxToken) {
+    //     allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    // } else {
+    allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    // }
 }
 
 template <typename T>

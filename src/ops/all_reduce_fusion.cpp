@@ -4,6 +4,8 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
 
+using namespace allreduce_fusion;
+
 template <typename T>
 struct KernelElementType {
     using type = T;
@@ -53,6 +55,9 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
     size_in_bytes_ = size_in_bytes;
 
     int data_size = size_in_bytes * 2 + nblocks * world_size * sizeof(int);
+    int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
+    data_size += one_shot_comm_size; // nclocks:3
+
     gpuMalloc(&data_, data_size);
     gpuMemset(data_, 0, data_size);
 
@@ -61,12 +66,33 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
 
     gpuMalloc(&twoshot_sync_clock_, sizeof(int));
     gpuMemset(twoshot_sync_clock_, 0, sizeof(int));
+
+    // oneshot
+
+    gpuMalloc(&oneshot_sync_clock_, sizeof(int));
+    gpuMemset(oneshot_sync_clock_, 0, sizeof(int));
+
+    int size = details::kOneShotMaxSize * world_size;
+    gpuMalloc(&oneshot_comm_size_, sizeof(int));
+    gpuMemcpy(oneshot_comm_size_, &size, sizeof(int), gpuMemcpyHostToDevice);
+
+    gpuMalloc(&oneshot_clear_, sizeof(int));
+    gpuMemset(oneshot_clear_, 0, sizeof(int));
+
+    std::vector<float> arr;
+    arr.resize(one_shot_comm_size / sizeof(__bfloat16), neg_zero_v<__bfloat16>);
+    gpuMemcpy((char *)data_ + size_in_bytes * 2 + nblocks * world_size * sizeof(int), arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+    dtype_ = ScalarType::BFloat16;
+    gpuDeviceSynchronize();
 }
 
 CommWorkspace::~CommWorkspace() {
     gpuFree(counter_);
     gpuFree(twoshot_sync_clock_);
     gpuFree(data_);
+    gpuFree(oneshot_sync_clock_);
+    gpuFree(oneshot_clear_);
+    gpuFree(oneshot_comm_size_);
 }
 
 Tensor CommWorkspace::get_handle() {
@@ -100,19 +126,42 @@ void CommWorkspace::open_handles(std::vector<Tensor> handles) {
     for (int i = 0; i < world_size_; ++i) {
         twoshot_comm_bufs_[i] = ipc_data_[i];
         twoshot_barrier_flags_[i] = (int *)((char *)ipc_data_[i] + 2 * size_in_bytes_);
+        // oneshot
+        oneshot_comm_bufs_[i] = (void *)((char *)ipc_data_[i] + 2 * size_in_bytes_ + nblocks_ * world_size_ * sizeof(int));
     }
 }
 
-Tensor CommWorkspace::get_workspace() {
+Tensor CommWorkspace::get_workspace(const Tensor &ref) {
     std::vector<void *> workspace(world_size_ * 3 + 5);
+    auto dtype = ref.scalar_type();
+    if (dtype != dtype_) {
+        int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
+        if (dtype == ScalarType::Float) {
+            std::vector<float> arr;
+            arr.resize(one_shot_comm_size / sizeof(float), neg_zero_v<float>);
+            gpuMemcpy(oneshot_comm_bufs_[rank_], arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+        } else if (dtype == ScalarType::Half || dtype == ScalarType::BFloat16) {
+            std::vector<__half> arr;
+            arr.resize(one_shot_comm_size / sizeof(__half), neg_zero_v<__half>);
+            gpuMemcpy(oneshot_comm_bufs_[rank_], arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+        } else {
+            TORCH_CHECK(false);
+        }
+        dtype_ = dtype;
+    }
     for (int peer = 0; peer < world_size_; ++peer) {
         workspace[peer] = (void *)twoshot_comm_bufs_[peer];
         workspace[world_size_ + peer] = (void *)twoshot_barrier_flags_[peer];
+        workspace[2 * world_size_ + peer] = (void *)oneshot_comm_bufs_[peer];
     }
     workspace[world_size_ * 3 + 0] = (void *)counter_;
     workspace[world_size_ * 3 + 1] = (void *)twoshot_sync_clock_;
+    // oneshot
+    workspace[world_size_ * 3 + 2] = (void *)oneshot_sync_clock_;
+    workspace[world_size_ * 3 + 3] = (void *)oneshot_comm_size_;
+    workspace[world_size_ * 3 + 4] = (void *)oneshot_clear_;
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
     auto workspace_tensor = torch::empty({static_cast<int64_t>(workspace.size() * sizeof(void *))}, options);
     std::memcpy(workspace_tensor.data_ptr(), workspace.data(), workspace.size() * sizeof(void *));
-    return workspace_tensor;
+    return workspace_tensor.to(ref.device());
 }

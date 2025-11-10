@@ -8,7 +8,7 @@ import torch_dist_ext
 
 
 envs = {  
-    "HIP_VISIBLE_DEVICES": "0,1,6,7",
+    "HIP_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
 }
 for k,v in envs.items():
     os.environ[k] = v
@@ -32,12 +32,12 @@ def setup(rank, world_size):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend='nccl',
-        init_method='tcp://127.0.0.1:23457',
+        init_method='tcp://127.0.0.1:23459',
         rank=rank,
         world_size=world_size)
 
 
-def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, use_fused=True):
+def worker(rank, world_size, allreduce_in, residual_in, rms, ref_residual_out, ref_norm_out, eps, use_fused=True):
     setup(rank, world_size)
     torch_dist_ext.setup_env(rank, world_size)
     num_tokens, hidden_dim = residual_in.shape
@@ -57,7 +57,7 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_norm_out, eps, 
             local_norm_out = local_rms(local_allreduce_in + local_residual_in)
         else:
             local_norm_out, local_residual_out = torch_dist_ext.allreduce_rms(rank, world_size, local_allreduce_in, local_residual_in, 
-                local_rms.weight.data, eps, torch_dist_ext.get_workspace())
+                local_rms.weight.data, eps, torch_dist_ext.get_workspace(local_allreduce_in))
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
     print(f"rank:{rank}, maxdiff:{maxdiff}")
     # assert torch.allclose(local_norm_out.cpu(), ref_norm_out)
@@ -71,8 +71,9 @@ def main():
         allreduce_in = torch.randn(world_size, num_tokens, hidden_dim, dtype=dtype)
         residual_in = torch.randn(num_tokens, hidden_dim, dtype=dtype)
         rms = RMSNorm(hidden_dim, dtype=dtype)
-        ref_norm_out = rms(allreduce_in.sum(dim=0) + residual_in)
-        mp.spawn(worker, args=(world_size, allreduce_in, residual_in, rms, ref_norm_out, eps), nprocs=world_size, join=True)
+        ref_residual_out = allreduce_in.sum(dim=0) + residual_in
+        ref_norm_out = rms(ref_residual_out)
+        mp.spawn(worker, args=(world_size, allreduce_in, residual_in, rms, ref_residual_out, ref_norm_out, eps), nprocs=world_size, join=True)
     testcase(dtype=torch.float)
     testcase(dtype=torch.bfloat16)
     testcase(dtype=torch.half)

@@ -24,14 +24,17 @@ class CommProcess:
         handle = self.comm.get_handle()
         handle_list = [None] * world_size
         dist.all_gather_object(handle_list, handle, group=group)
+        torch.cuda.synchronize(rank)
+        dist.barrier(group=group)
         self.comm.open_handles(handle_list)
+        torch.cuda.synchronize(rank)
+        dist.barrier(group=group)
 
-    def workspace(self):
-        return self.comm.get_workspace()
+    def get_workspace(self, ref):
+        return self.comm.get_workspace(ref)
 
 
 comm = None
-workspace = None
 world_size_ = None
 
 
@@ -40,20 +43,18 @@ def setup_env(rank, world_size, max_size_in_bytes=8192*16384, group=None):
     global workspace
     global world_size_
     comm = CommProcess(rank, world_size, max_size_in_bytes, group)
-    workspace = comm.workspace()
-    workspace = workspace.cuda(rank)
     world_size_ = world_size
 
 
 @torch.library.custom_op("torch_dist_ext::get_workspace", mutates_args=[])
-def get_workspace() -> torch.Tensor:
-    global workspace
-    assert workspace is not None
-    return workspace
+def get_workspace(ref: torch.Tensor) -> torch.Tensor:
+    global comm
+    assert comm is not None
+    return comm.get_workspace(ref)
 
 
 @torch.library.register_fake("torch_dist_ext::get_workspace")
-def get_workspace_fake() -> torch.Tensor:
+def get_workspace_fake(ref: torch.Tensor) -> torch.Tensor:
     global world_size_
     assert world_size_ is not None
     nbytes = (world_size_ * 3 + 5) * ctypes.sizeof(ctypes.c_void_p)
