@@ -44,6 +44,7 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_residual_out, r
     local_allreduce_in = allreduce_in[rank].cuda(rank)
     local_residual_in = residual_in.cuda(rank)
     local_rms = rms.cuda(rank)
+    workspace = torch_dist_ext.get_workspace(local_allreduce_in)
     torch.cuda.synchronize()
     dist.barrier()
     prof = torch.profiler.profile(
@@ -57,7 +58,7 @@ def worker(rank, world_size, allreduce_in, residual_in, rms, ref_residual_out, r
             local_norm_out = local_rms(local_allreduce_in + local_residual_in)
         else:
             local_norm_out, local_residual_out = torch_dist_ext.allreduce_rms(rank, world_size, local_allreduce_in, local_residual_in, 
-                local_rms.weight.data, eps, torch_dist_ext.get_workspace(local_allreduce_in))
+                local_rms.weight.data, eps, workspace)
     maxdiff = (local_norm_out.cpu() - ref_norm_out).abs().max()
     print(f"rank:{rank}, maxdiff:{maxdiff}")
     # assert torch.allclose(local_norm_out.cpu(), ref_norm_out)
@@ -74,9 +75,16 @@ def main():
         ref_residual_out = allreduce_in.sum(dim=0) + residual_in
         ref_norm_out = rms(ref_residual_out)
         mp.spawn(worker, args=(world_size, allreduce_in, residual_in, rms, ref_residual_out, ref_norm_out, eps), nprocs=world_size, join=True)
-    testcase(dtype=torch.float)
-    testcase(dtype=torch.bfloat16)
-    testcase(dtype=torch.half)
+    num_tokens = 129
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
+    testcase(num_tokens=num_tokens, dtype=torch.half)
+    num_tokens = 128
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.float)
+    testcase(num_tokens=num_tokens, dtype=torch.bfloat16)
+    testcase(num_tokens=num_tokens, dtype=torch.half)
 
 
 if __name__ == '__main__':

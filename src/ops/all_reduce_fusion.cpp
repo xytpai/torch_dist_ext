@@ -48,7 +48,20 @@ void allreduce_rms_fusion(int64_t rank, int64_t nranks, Tensor &allreduce_in, Te
         });
 }
 
+template <typename T>
+void flush_data(void *data, int one_shot_comm_size) {
+    using element_t = typename neg_zero<T>::bits_type;
+    std::vector<element_t> arr;
+    arr.resize(one_shot_comm_size / sizeof(T));
+    for (int i = 0; i < one_shot_comm_size / sizeof(element_t); ++i) {
+        volatile element_t v = neg_zero<T>::neg_zero_bits;
+        arr[i] = v;
+    }
+    gpuMemcpy(data, arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+}
+
 CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, int64_t size_in_bytes) {
+    gpuSetDevice(rank);
     rank_ = rank;
     world_size_ = world_size;
     nblocks_ = nblocks;
@@ -56,11 +69,9 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
 
     int data_size = size_in_bytes * 2 + nblocks * world_size * sizeof(int);
     int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
-    data_size += one_shot_comm_size; // nclocks:3
+    data_size += one_shot_comm_size;
 
     gpuMalloc(&data_, data_size);
-    gpuMemset(data_, 0, data_size);
-
     gpuMalloc(&counter_, sizeof(int));
     gpuMemset(counter_, 0, sizeof(int));
 
@@ -79,10 +90,8 @@ CommWorkspace::CommWorkspace(int64_t rank, int64_t world_size, int64_t nblocks, 
     gpuMalloc(&oneshot_clear_, sizeof(int));
     gpuMemset(oneshot_clear_, 0, sizeof(int));
 
-    std::vector<float> arr;
-    arr.resize(one_shot_comm_size / sizeof(__bfloat16), neg_zero_v<__bfloat16>);
-    gpuMemcpy((char *)data_ + size_in_bytes * 2 + nblocks * world_size * sizeof(int), arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
-    dtype_ = ScalarType::BFloat16;
+    flush_data<float>((void *)((char *)data_ + size_in_bytes * 2 + nblocks * world_size * sizeof(int)), one_shot_comm_size);
+    dtype_ = ScalarType::Float;
     gpuDeviceSynchronize();
 }
 
@@ -134,18 +143,16 @@ void CommWorkspace::open_handles(std::vector<Tensor> handles) {
 Tensor CommWorkspace::get_workspace(const Tensor &ref) {
     std::vector<void *> workspace(world_size_ * 3 + 5);
     auto dtype = ref.scalar_type();
+    int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
     if (dtype != dtype_) {
-        int one_shot_comm_size = details::kOneShotMaxSize * world_size_ * 3;
         if (dtype == ScalarType::Float) {
-            std::vector<float> arr;
-            arr.resize(one_shot_comm_size / sizeof(float), neg_zero_v<float>);
-            gpuMemcpy(oneshot_comm_bufs_[rank_], arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
-        } else if (dtype == ScalarType::Half || dtype == ScalarType::BFloat16) {
-            std::vector<__half> arr;
-            arr.resize(one_shot_comm_size / sizeof(__half), neg_zero_v<__half>);
-            gpuMemcpy(oneshot_comm_bufs_[rank_], arr.data(), one_shot_comm_size, gpuMemcpyHostToDevice);
+            flush_data<float>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
+        } else if (dtype == ScalarType::Half) {
+            flush_data<__half>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
+        } else if (dtype == ScalarType::BFloat16) {
+            flush_data<__bfloat16>(oneshot_comm_bufs_[rank_], one_shot_comm_size);
         } else {
-            TORCH_CHECK(false);
+            TORCH_CHECK("datatype not support!");
         }
         dtype_ = dtype;
     }

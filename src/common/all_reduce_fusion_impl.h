@@ -27,24 +27,18 @@ static constexpr int kOneShotMaxSize = kOneShotMaxToken * 1024 * kBytesPerAccess
 
 namespace block_utils {
 
-#ifdef __CUDACC__
-template <typename T>
-__inline__ __device__ T warp_reduce_sum(T val) {
-#pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
-    return val;
-}
-#else
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T val) {
 #pragma unroll
     for (int offset = (32 >> 1); offset > 0; offset >>= 1) {
+#ifdef __CUDACC__
+        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
+#else
         val += __shfl_xor(val, offset, 32);
+#endif
     }
     return val;
 }
-#endif
 
 template <typename T>
 __inline__ __device__ T block_reduce_sum(T val) {
@@ -222,11 +216,56 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     __device__ __forceinline__ T const &operator[](int i) const {
         return data[i];
     }
-    __device__ __forceinline__ void load(T *ptr) {
-        *this = *reinterpret_cast<vec_t<T, vec_size> *>(ptr);
+    __device__ __forceinline__ void load(const T *ptr) {
+        *this = *reinterpret_cast<vec_t<T, vec_size> *>(const_cast<T *>(ptr));
+    }
+    __device__ __forceinline__ void loop_load(const T *ptr) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            data[i] = ptr[i];
+        }
     }
     __device__ __forceinline__ void store(T *ptr) {
         *reinterpret_cast<vec_t<T, vec_size> *>(ptr) = *this;
+    }
+    __device__ __forceinline__ void loop_store(T *ptr) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            ptr[i] = data[i];
+        }
+    }
+    __device__ __forceinline__ void nontemporal_load(const T *ptr) {
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+#pragma unroll
+        for (int i = 0; i < ITERS; ++i) {
+            reinterpret_cast<uint32_t *>(&data)[i] = __builtin_nontemporal_load((uint32_t *)ptr + i);
+        }
+    }
+    __device__ __forceinline__ void nontemporal_store(T *ptr) {
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+#pragma unroll
+        for (int i = 0; i < ITERS; ++i) {
+            __builtin_nontemporal_store(reinterpret_cast<uint32_t *>(&data)[i], (uint32_t *)ptr + i);
+        }
+    }
+    __device__ __forceinline__ void volatile_load(const T *ptr) {
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+#pragma unroll
+        for (int i = 0; i < ITERS; ++i) {
+            reinterpret_cast<uint32_t *>(&data)[i] = __scoped_atomic_load_n((uint32_t *)ptr + i,
+                                                                            __ATOMIC_ACQUIRE,
+                                                                            __MEMORY_SCOPE_SYSTEM);
+        }
+    }
+    __device__ __forceinline__ void volatile_store(T *ptr) {
+        constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
+#pragma unroll
+        for (int i = 0; i < ITERS; ++i) {
+            __scoped_atomic_store_n((uint32_t *)ptr + i,
+                                    reinterpret_cast<uint32_t *>(&data)[i],
+                                    __ATOMIC_RELEASE,
+                                    __MEMORY_SCOPE_SYSTEM);
+        }
     }
     __device__ __forceinline__ void fill(T val) {
 #pragma unroll
@@ -444,11 +483,14 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gp
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
     dim3 numBlocks(NBLOCKS_PER_GPU);
-    // if (token_num <= details::kOneShotMaxToken) {
-    //     allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
-    // } else {
-    allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
-    // }
+    void *args[] = {(void *)&params};
+    if (token_num <= details::kOneShotMaxToken) {
+        gpuLaunchCooperativeKernel(allreduce_fusion_kernel_oneshot_lamport<T, NRanks>, numBlocks, threadsPerBlock, args, 0, stream);
+        // allreduce_fusion_kernel_oneshot_lamport<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    } else {
+        gpuLaunchCooperativeKernel(allreduce_fusion_kernel_twoshot_direct<T, NRanks>, numBlocks, threadsPerBlock, args, 0, stream);
+        // allreduce_fusion_kernel_twoshot_direct<T, NRanks><<<numBlocks, threadsPerBlock, 0, stream>>>(params);
+    }
 }
 
 template <typename T>
