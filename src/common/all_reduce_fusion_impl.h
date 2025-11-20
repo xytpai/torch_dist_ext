@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <functional>
 #include <random>
 #include <vector>
 #include <array>
@@ -22,31 +23,28 @@ namespace details {
 static constexpr int kBytesPerAccess = 16;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kOneShotMaxSize = kOneShotMaxToken * 1024 * kBytesPerAccess;
+static constexpr float FP8_E4M3_MAX = 240;
 
 } // namespace details
 
 namespace block_utils {
 
-template <typename T>
-__device__ __forceinline__ T warp_reduce_sum(T val) {
+template <typename T, typename func_t>
+__device__ __forceinline__ T warp_reduce(T val, func_t fn) {
 #pragma unroll
     for (int offset = (32 >> 1); offset > 0; offset >>= 1) {
-#ifdef __CUDACC__
-        val += __shfl_xor_sync(0xffffffff, val, mask, 32);
-#else
-        val += __shfl_xor(val, offset, 32);
-#endif
+        val = fn(val, __shfl_xor(val, offset, 32));
     }
     return val;
 }
 
-template <typename T>
-__inline__ __device__ T block_reduce_sum(T val) {
+template <typename T, typename func_t>
+__inline__ __device__ T block_reduce(T val, func_t fn) {
     static __shared__ T shared[32];
     const int tid = threadIdx.x;
     const int w_tid = tid % 32;
     const int wid = tid / 32;
-    val = warp_reduce_sum(val);
+    val = warp_reduce<T, func_t>(val, fn);
     if (w_tid == 0) {
         shared[wid] = val;
     }
@@ -54,7 +52,7 @@ __inline__ __device__ T block_reduce_sum(T val) {
     bool is_mask = threadIdx.x < (blockDim.x / 32.f);
     val = is_mask ? shared[w_tid] : (T)(0.0f);
     __syncthreads();
-    val = warp_reduce_sum(val);
+    val = warp_reduce<T, func_t>(val, fn);
     return val;
 }
 
@@ -219,20 +217,8 @@ struct alignas(sizeof(T) * vec_size) vec_t {
     __device__ __forceinline__ void load(const T *ptr) {
         *this = *reinterpret_cast<vec_t<T, vec_size> *>(const_cast<T *>(ptr));
     }
-    __device__ __forceinline__ void loop_load(const T *ptr) {
-#pragma unroll
-        for (int i = 0; i < vec_size; ++i) {
-            data[i] = ptr[i];
-        }
-    }
     __device__ __forceinline__ void store(T *ptr) {
         *reinterpret_cast<vec_t<T, vec_size> *>(ptr) = *this;
-    }
-    __device__ __forceinline__ void loop_store(T *ptr) {
-#pragma unroll
-        for (int i = 0; i < vec_size; ++i) {
-            ptr[i] = data[i];
-        }
     }
     __device__ __forceinline__ void nontemporal_load(const T *ptr) {
         constexpr int ITERS = vec_size * sizeof(T) / sizeof(uint32_t);
@@ -273,6 +259,13 @@ struct alignas(sizeof(T) * vec_size) vec_t {
             data[i] = val;
         }
     }
+    template <typename VT>
+    __device__ __forceinline__ void cast_fill(VT val) {
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+            *reinterpret_cast<VT *>(&data[i]) = val;
+        }
+    }
 };
 
 template <typename T, uint32_t VEC_SIZE>
@@ -281,6 +274,26 @@ __device__ __forceinline__ void vec_add_(vec_t<T, VEC_SIZE> &self,
 #pragma unroll
     for (int i = 0; i < VEC_SIZE; ++i) {
         self[i] = (float)self[i] + (float)other[i];
+    }
+}
+
+template <typename T, int VEC_SIZE, int NRanks>
+__device__ __forceinline__ void vec_add_r_(vec_t<T, VEC_SIZE> (&self)[NRanks]) {
+    vec_t<float, VEC_SIZE> acc;
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        acc[i] = (float)self[0][i];
+    }
+#pragma unroll
+    for (int r = 1; r < NRanks; ++r) {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+            acc[i] += (float)self[r][i];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+        self[0][i] = (T)acc[i];
     }
 }
 
@@ -313,7 +326,7 @@ __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(
         float v = static_cast<float>(reinterpret_cast<T const *>(&residual)[i]);
         acc += v * v;
     }
-    acc = block_utils::block_reduce_sum<float>(acc);
+    acc = block_utils::block_reduce<float>(acc, std::plus<float>());
     if (threadIdx.x == 0) {
         s_val = rsqrtf(acc / m_params.hidden_dim + m_params.rms_eps);
     }
@@ -356,10 +369,7 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
         for (int r = 0; r < NRanks; ++r) {
             vals[r].load(reinterpret_cast<T *>(comm.comm_bufs[r]) + idx);
         }
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r) {
-            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
-        }
+        vec_add_r_<T, VEC_SIZE, NRanks>(vals);
 #pragma unroll
         for (int r = 0; r < NRanks; ++r) {
             vals[0].store(reinterpret_cast<T *>(comm.comm_bufs[r]) + params.size + idx);
@@ -378,11 +388,6 @@ __global__ void allreduce_fusion_kernel_twoshot_direct(AllReduceFusionParams<T> 
             vec_add_<T, VEC_SIZE>(data[0], data[1]);
             data[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
             auto val = rms_norm<T, VEC_SIZE>(params, data[0], gamma);
-            // #pragma unroll
-            //             for (int i = 0; i < VEC_SIZE; ++i) {
-            //                 reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(
-            //                     static_cast<float>(val[i]) * m_scale_factor);
-            //             }
             val.store(reinterpret_cast<T *>(params.norm_out) + idx);
         }
     }
@@ -418,7 +423,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     int access_stride = gridDim.x * params.hidden_dim;
 
     vec_t<T, VEC_SIZE> clear_vec;
-    clear_vec.fill(neg_zero_v<T>);
+    clear_vec.cast_fill(neg_zero<T>::neg_zero_bits);
 
     vec_t<T, VEC_SIZE> gamma;
     gamma.load(reinterpret_cast<T *>(params.rms_gamma) + access_id_in_token);
@@ -458,12 +463,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
                 done &= !has_neg_zero<T, VEC_SIZE>(vals[r]);
             }
         }
-
-#pragma unroll
-        for (int r = 1; r < NRanks; ++r) {
-            vec_add_<T, VEC_SIZE>(vals[0], vals[r]);
-        }
-
+        vec_add_r_<T, VEC_SIZE, NRanks>(vals);
         vec_add_<T, VEC_SIZE>(vals[0], residual);
         vals[0].store(reinterpret_cast<T *>(params.residual_out) + idx);
         auto val = rms_norm<T, VEC_SIZE>(params, vals[0], gamma);
@@ -482,7 +482,11 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const &params, gp
     int threads_per_token = params.hidden_dim / VEC_SIZE;
     int threads_per_block = threads_per_token;
     dim3 threadsPerBlock(threads_per_block);
-    dim3 numBlocks(NBLOCKS_PER_GPU);
+    int nblocks = std::min(token_num, NBLOCKS_PER_GPU);
+    if (params.size * sizeof(T) >= 1024 * 1024 * 128) {
+        nblocks /= 2;
+    }
+    dim3 numBlocks(nblocks);
     void *args[] = {(void *)&params};
     if (token_num <= details::kOneShotMaxToken) {
         gpuLaunchCooperativeKernel(allreduce_fusion_kernel_oneshot_lamport<T, NRanks>, numBlocks, threadsPerBlock, args, 0, stream);

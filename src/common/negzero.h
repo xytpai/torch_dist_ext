@@ -26,6 +26,13 @@ struct neg_zero<float> {
     using bits_type = unsigned int;
 };
 
+template <>
+struct neg_zero<double> {
+    static constexpr uint64_t neg_zero_bits = 0x8000000000000000ULL;
+    static constexpr double value = -0.0f;
+    using bits_type = uint64_t;
+};
+
 template <typename T>
 __device__ static constexpr T neg_zero_v = neg_zero<T>::value;
 
